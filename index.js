@@ -61,7 +61,7 @@ app.post("/webhook", async (req, res) => {
         const fileName = `${Date.now()}_${defaultName.replace(/\s+/g, '_')}`;
 
         // 3. Get Media URL (Using v22.0)
-        const urlRes = await axios.get(`https://graph.facebook.com/v22.0/${mediaId}`, {
+        const urlRes = await axios.get(`https://graph.facebook.com/v24.0/${mediaId}`, {
             headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` }
         });
 
@@ -93,7 +93,7 @@ app.post("/webhook", async (req, res) => {
 async function sendMessage(phoneId, to, textBody) {
   try {
     await axios.post(
-      `https://graph.facebook.com/v22.0/${phoneId}/messages`, // Using v22.0
+      `https://graph.facebook.com/v24.0/${phoneId}/messages`, // Using v22.0
       {
         messaging_product: "whatsapp",
         to: to,
@@ -120,4 +120,4 @@ app.get("/", async (req, res) => {
     } catch (e) { res.send("Error loading files"); }
 });
 
-app.listen(PORT, () => console.log(`Server v22.0 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server v24.0 running on port ${PORT}`));
