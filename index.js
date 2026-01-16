@@ -1,7 +1,8 @@
 const express = require("express");
 const bodyParser = require("body-parser");
 const axios = require("axios");
-const { put, list } = require("@vercel/blob");
+// 1. ADD 'del' to imports
+const { put, list, del } = require("@vercel/blob");
 const path = require("path");
 require("dotenv").config();
 
@@ -15,7 +16,28 @@ function generatePin() {
   return Math.floor(1000 + Math.random() * 9000).toString();
 }
 
-// 1. WEBHOOK VERIFICATION (For WhatsApp Handshake)
+// --- NEW HELPER: Delete files older than 10 minutes ---
+async function cleanupOldFiles() {
+  try {
+    const { blobs } = await list({ token: process.env.BLOB_READ_WRITE_TOKEN });
+    const tenMinutesAgo = Date.now() - 10 * 60 * 1000; // 10 minutes in ms
+
+    // Find files older than 10 minutes
+    const urlsToDelete = blobs
+      .filter(blob => new Date(blob.uploadedAt).getTime() < tenMinutesAgo)
+      .map(blob => blob.url);
+
+    if (urlsToDelete.length > 0) {
+      console.log(`🧹 Cleaning up: Deleting ${urlsToDelete.length} old files...`);
+      await del(urlsToDelete, { token: process.env.BLOB_READ_WRITE_TOKEN });
+      console.log("✅ Cleanup complete.");
+    }
+  } catch (error) {
+    console.error("❌ Cleanup failed:", error.message);
+  }
+}
+
+// 1. WEBHOOK VERIFICATION
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
@@ -29,11 +51,10 @@ app.get("/webhook", (req, res) => {
   }
 });
 
-// 2. RECEIVE MESSAGE & SAVE FILE (The Bot Logic)
+// 2. RECEIVE & REPLY
 app.post("/webhook", async (req, res) => {
   const body = req.body;
 
-  // Check if it's a valid WhatsApp message
   if (!body.object) return res.sendStatus(404);
 
   try {
@@ -41,27 +62,21 @@ app.post("/webhook", async (req, res) => {
     const changes = entry?.changes?.[0];
     const value = changes?.value;
     const message = value?.messages?.[0];
-
-    // Get the Phone Number ID that received the message
     const businessPhoneId = value?.metadata?.phone_number_id;
 
     if (message) {
-      const from = message.from; // User's phone number
+      const from = message.from;
       const msgType = message.type;
 
-      // --- LOGIC: Handle Text ---
       if (msgType === "text") {
         await sendMessage(businessPhoneId, from, "Send me a Document or Photo, and I'll give you a 4-digit PIN.");
       } 
       
-      // --- LOGIC: Handle Documents & Images ---
       else if (msgType === "document" || msgType === "image") {
         console.log(`📂 Received ${msgType} from ${from}`);
 
-        // 1. Get Media ID
         const mediaId = msgType === "document" ? message.document.id : message.image.id;
         
-        // 2. Determine Extension (e.g. .pdf, .jpg)
         let extension = "";
         if (msgType === "document") {
             const originalName = message.document.filename;
@@ -70,31 +85,28 @@ app.post("/webhook", async (req, res) => {
             extension = ".jpg";
         }
 
-        // 3. Generate PIN and Filename
         const pin = generatePin();
-        const fileName = `${pin}${extension}`; // e.g. "1234.pdf"
+        const fileName = `${pin}${extension}`;
 
-        // 4. Get Media URL from Facebook
         const urlRes = await axios.get(`https://graph.facebook.com/v24.0/${mediaId}`, {
             headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` }
         });
 
-        // 5. Download the File Binary Data
         const fileRes = await axios.get(urlRes.data.url, {
             responseType: "arraybuffer",
             headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` }
         });
 
-        // 6. Save to Vercel Blob (Exact Name)
-        // 'addRandomSuffix: false' ensures the file is named exactly "1234.pdf"
         await put(fileName, fileRes.data, {
             access: 'public',
             token: process.env.BLOB_READ_WRITE_TOKEN,
             addRandomSuffix: false 
         });
 
-        // 7. Reply to User with the PIN
-        await sendMessage(businessPhoneId, from, `✅ Document Saved!\n\nYour PIN is: *${pin}*`);
+        // Trigger cleanup after upload
+        cleanupOldFiles();
+
+        await sendMessage(businessPhoneId, from, `✅ Document Saved!\n\nYour PIN is: *${pin}*\n\n(Valid for 10 minutes)`);
       }
     }
     res.sendStatus(200);
@@ -105,20 +117,25 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// --- API ENDPOINT FOR FLUTTER APP (JSON) ---
-// This is what your Flutter app calls to get the list of files
+// --- API ENDPOINT (Flutter App) ---
 app.get("/api/files", async (req, res) => {
     try {
+        // Run cleanup before listing
+        await cleanupOldFiles();
+
         const { blobs } = await list({ token: process.env.BLOB_READ_WRITE_TOKEN });
-        res.json(blobs); // Returns pure JSON list
+        res.json(blobs);
     } catch (e) {
         res.status(500).json({ error: "Failed to list files" });
     }
 });
 
-// --- UI PAGE FOR BROWSERS (HTML) ---
+// --- UI PAGE (Browser) ---
 app.get("/", async (req, res) => {
     try {
+        // Run cleanup before showing UI
+        await cleanupOldFiles();
+
         const { blobs } = await list({ token: process.env.BLOB_READ_WRITE_TOKEN });
         
         let fileRows = blobs.map(blob => `
@@ -175,7 +192,7 @@ app.get("/", async (req, res) => {
     }
 });
 
-// --- HELPER: Send Message to WhatsApp ---
+// --- HELPER: Send Message ---
 async function sendMessage(phoneId, to, textBody) {
   const senderId = phoneId || process.env.PHONE_NUMBER_ID; 
   try {
@@ -195,7 +212,7 @@ async function sendMessage(phoneId, to, textBody) {
       }
     );
   } catch (err) {
-    console.error("Failed to send message:", err.response ? err.response.data : err.message);
+    console.error("Failed to send message");
   }
 }
 
