@@ -10,12 +10,12 @@ app.use(bodyParser.json());
 
 const PORT = process.env.PORT || 3000;
 
-// Helper: Generate random 4-digit PIN
+// --- HELPER: Generate random 4-digit PIN ---
 function generatePin() {
   return Math.floor(1000 + Math.random() * 9000).toString();
 }
 
-// 1. WEBHOOK VERIFICATION
+// 1. WEBHOOK VERIFICATION (For WhatsApp Handshake)
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
@@ -29,10 +29,11 @@ app.get("/webhook", (req, res) => {
   }
 });
 
-// 2. RECEIVE & REPLY
+// 2. RECEIVE MESSAGE & SAVE FILE (The Bot Logic)
 app.post("/webhook", async (req, res) => {
   const body = req.body;
 
+  // Check if it's a valid WhatsApp message
   if (!body.object) return res.sendStatus(404);
 
   try {
@@ -40,10 +41,12 @@ app.post("/webhook", async (req, res) => {
     const changes = entry?.changes?.[0];
     const value = changes?.value;
     const message = value?.messages?.[0];
+
+    // Get the Phone Number ID that received the message
     const businessPhoneId = value?.metadata?.phone_number_id;
 
     if (message) {
-      const from = message.from;
+      const from = message.from; // User's phone number
       const msgType = message.type;
 
       // --- LOGIC: Handle Text ---
@@ -55,9 +58,10 @@ app.post("/webhook", async (req, res) => {
       else if (msgType === "document" || msgType === "image") {
         console.log(`📂 Received ${msgType} from ${from}`);
 
+        // 1. Get Media ID
         const mediaId = msgType === "document" ? message.document.id : message.image.id;
         
-        // Determine Extension
+        // 2. Determine Extension (e.g. .pdf, .jpg)
         let extension = "";
         if (msgType === "document") {
             const originalName = message.document.filename;
@@ -66,28 +70,30 @@ app.post("/webhook", async (req, res) => {
             extension = ".jpg";
         }
 
-        // Generate PIN and Filename
+        // 3. Generate PIN and Filename
         const pin = generatePin();
         const fileName = `${pin}${extension}`; // e.g. "1234.pdf"
 
-        // Get URL & Download
+        // 4. Get Media URL from Facebook
         const urlRes = await axios.get(`https://graph.facebook.com/v24.0/${mediaId}`, {
             headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` }
         });
 
+        // 5. Download the File Binary Data
         const fileRes = await axios.get(urlRes.data.url, {
             responseType: "arraybuffer",
             headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` }
         });
 
-        // Save to Vercel Blob (Exact Name)
+        // 6. Save to Vercel Blob (Exact Name)
+        // 'addRandomSuffix: false' ensures the file is named exactly "1234.pdf"
         await put(fileName, fileRes.data, {
             access: 'public',
             token: process.env.BLOB_READ_WRITE_TOKEN,
-            addRandomSuffix: false // Crucial: Keeps filename exactly "1234.pdf"
+            addRandomSuffix: false 
         });
 
-        // Reply with PIN
+        // 7. Reply to User with the PIN
         await sendMessage(businessPhoneId, from, `✅ Document Saved!\n\nYour PIN is: *${pin}*`);
       }
     }
@@ -99,36 +105,22 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// --- HELPER: Send Message ---
-async function sendMessage(phoneId, to, textBody) {
-  const senderId = phoneId || process.env.PHONE_NUMBER_ID; 
-  try {
-    await axios.post(
-      `https://graph.facebook.com/v24.0/${senderId}/messages`, 
-      {
-        messaging_product: "whatsapp",
-        to: to,
-        type: "text",
-        text: { body: textBody }
-      },
-      { 
-        headers: { 
-          Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
-          "Content-Type": "application/json"
-        } 
-      }
-    );
-  } catch (err) {
-    console.error("Failed to send message");
-  }
-}
+// --- API ENDPOINT FOR FLUTTER APP (JSON) ---
+// This is what your Flutter app calls to get the list of files
+app.get("/api/files", async (req, res) => {
+    try {
+        const { blobs } = await list({ token: process.env.BLOB_READ_WRITE_TOKEN });
+        res.json(blobs); // Returns pure JSON list
+    } catch (e) {
+        res.status(500).json({ error: "Failed to list files" });
+    }
+});
 
-// --- FEATURE: Better UI Home Page ---
+// --- UI PAGE FOR BROWSERS (HTML) ---
 app.get("/", async (req, res) => {
     try {
         const { blobs } = await list({ token: process.env.BLOB_READ_WRITE_TOKEN });
         
-        // Generate HTML Table
         let fileRows = blobs.map(blob => `
             <tr>
                 <td style="padding: 12px; border-bottom: 1px solid #ddd; font-weight: bold; color: #333;">${blob.pathname}</td>
@@ -182,5 +174,29 @@ app.get("/", async (req, res) => {
         res.status(500).send("Error loading files."); 
     }
 });
+
+// --- HELPER: Send Message to WhatsApp ---
+async function sendMessage(phoneId, to, textBody) {
+  const senderId = phoneId || process.env.PHONE_NUMBER_ID; 
+  try {
+    await axios.post(
+      `https://graph.facebook.com/v24.0/${senderId}/messages`, 
+      {
+        messaging_product: "whatsapp",
+        to: to,
+        type: "text",
+        text: { body: textBody }
+      },
+      { 
+        headers: { 
+          Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
+          "Content-Type": "application/json"
+        } 
+      }
+    );
+  } catch (err) {
+    console.error("Failed to send message:", err.response ? err.response.data : err.message);
+  }
+}
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
