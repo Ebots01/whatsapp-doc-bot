@@ -1,104 +1,126 @@
-const express = require("express");
-const bodyParser = require("body-parser");
-const axios = require("axios");
-const path = require("path");
-require("dotenv").config();
+import 'package:flutter/material.dart';
+import 'package:open_filex/open_filex.dart';
+import 'dart:io';
+import 'package:path_provider/path_provider.dart';
+import 'whatsapp_api_service.dart';
 
-const app = express();
-app.use(bodyParser.json());
+class DocumentListScreen extends StatefulWidget {
+  @override
+  _DocumentListScreenState createState() => _DocumentListScreenState();
+}
 
-// In-memory store for active files (No Blob storage needed!)
-// format: { "1234": { mediaId: "...", extension: ".pdf", timestamp: 17000... } }
-let activeFiles = {};
+class _DocumentListScreenState extends State<DocumentListScreen> {
+  final WhatsAppApiService _apiService = WhatsAppApiService();
 
-const PORT = process.env.PORT || 3000;
+  Future<void> _handleDownload(String url, String fileName) async {
+    try {
+      // Show loading indicator
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("Downloading $fileName...")),
+      );
 
-// 1. WHATSAPP WEBHOOK VERIFICATION
-app.get("/webhook", (req, res) => {
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
+      final bytes = await _apiService.downloadFile(url);
+      
+      // Save to device
+      final dir = await getApplicationDocumentsDirectory();
+      final file = File('${dir.path}/$fileName');
+      await file.writeAsBytes(bytes);
 
-  if (mode === "subscribe" && token === process.env.VERIFY_TOKEN) {
-    res.status(200).send(challenge);
-  } else {
-    res.sendStatus(403);
-  }
-});
-
-// 2. RECEIVE WHATSAPP DOCUMENT
-app.post("/webhook", async (req, res) => {
-  const body = req.body;
-  try {
-    const message = body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-    const phoneId = body.entry?.[0]?.changes?.[0]?.value?.metadata?.phone_number_id;
-
-    if (message && (message.type === "document" || message.type === "image")) {
-      const msgType = message.type;
-      const mediaId = msgType === "document" ? message.document.id : message.image.id;
-      const extension = msgType === "document" 
-        ? (path.extname(message.document.filename) || ".pdf") 
-        : ".jpg";
-
-      // Generate a 4-digit PIN
-      const pin = Math.floor(1000 + Math.random() * 9000).toString();
-
-      // Save metadata only (Free! No Blob storage)
-      activeFiles[pin] = { mediaId, extension, timestamp: Date.now() };
-
-      // Notify user on WhatsApp
-      await axios.post(`https://graph.facebook.com/v24.0/${phoneId}/messages`, {
-        messaging_product: "whatsapp",
-        to: message.from,
-        type: "text",
-        text: { body: `✅ File received! Your PIN is: *${pin}*` }
-      }, { headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` } });
+      // Success Message with "Open" action
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text("Download Complete!"),
+          backgroundColor: Colors.green,
+          action: SnackBarAction(
+            label: "OPEN",
+            textColor: Colors.white,
+            onPressed: () => OpenFilex.open(file.path),
+          ),
+        ),
+      );
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("Error: $e"), backgroundColor: Colors.red),
+      );
     }
-    res.sendStatus(200);
-  } catch (e) {
-    res.sendStatus(500);
   }
-});
 
-// 3. FLUTTER API: Get list of active files
-// Matches your Flutter: WhatsAppConstants.API_ENDPOINT (/api/files)
-app.get("/api/files", (req, res) => {
-  const fileList = Object.keys(activeFiles).map(pin => ({
-    pathname: `${pin}${activeFiles[pin].extension}`,
-    url: `${process.env.SERVER_URL}/api/download/${pin}` // Points to the download route below
-  }));
-  res.json(fileList);
-});
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text("Received Documents"),
+        backgroundColor: Color(0xFF128C7E), // WhatsApp Green
+        actions: [
+          IconButton(
+            icon: Icon(Icons.refresh),
+            onPressed: () => setState(() {}),
+          )
+        ],
+      ),
+      body: FutureBuilder<List<dynamic>>(
+        future: _apiService.getBlobList(),
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting) {
+            return Center(child: CircularProgressIndicator());
+          } else if (snapshot.hasError || snapshot.data == null || snapshot.data!.isEmpty) {
+            return _buildEmptyState();
+          }
 
-// 4. FLUTTER API: Stream the actual file
-app.get("/api/download/:pin", async (req, res) => {
-  const { pin } = req.params;
-  const fileData = activeFiles[pin];
+          return ListView.builder(
+            padding: EdgeInsets.all(12),
+            itemCount: snapshot.data!.length,
+            itemBuilder: (context, index) {
+              final item = snapshot.data![index];
+              final String name = item['pathname'];
+              final String url = item['url'];
+              final String pin = name.split('.').first; // Extract PIN from filename
 
-  if (!fileData) return res.status(404).send("Expired or invalid PIN");
-
-  try {
-    // Get WhatsApp's temporary download URL
-    const urlRes = await axios.get(`https://graph.facebook.com/v24.0/${fileData.mediaId}`, {
-      headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` }
-    });
-
-    // Proxy/Stream the file bytes directly to Flutter
-    const response = await axios({
-      method: 'get',
-      url: urlRes.data.url,
-      responseType: 'stream',
-      headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` }
-    });
-
-    res.setHeader('Content-Type', 'application/octet-stream');
-    response.data.pipe(res);
-    
-    // Optional: Auto-delete from memory after download to stay "lightweight"
-    // delete activeFiles[pin]; 
-  } catch (error) {
-    res.status(500).send("Streaming failed");
+              return Card(
+                elevation: 3,
+                margin: EdgeInsets.symmetric(vertical: 8),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                child: ListTile(
+                  contentPadding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  leading: CircleAvatar(
+                    backgroundColor: Color(0xFF25D366).withOpacity(0.1),
+                    child: Icon(Icons.description, color: Color(0xFF128C7E)),
+                  ),
+                  title: Text(
+                    "Document #$pin",
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  subtitle: Text(name),
+                  trailing: ElevatedButton.icon(
+                    onPressed: () => _handleDownload(url, name),
+                    icon: Icon(Icons.download, size: 18),
+                    label: Text("GET"),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Color(0xFF25D366),
+                      foregroundColor: Colors.white,
+                      shape: StadiumBorder(),
+                    ),
+                  ),
+                ),
+              );
+            },
+          );
+        },
+      ),
+    );
   }
-});
 
-app.listen(PORT, () => console.log(`Server on ${PORT}`));
+  Widget _buildEmptyState() {
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(Icons.cloud_off, size: 80, color: Colors.grey),
+          SizedBox(height: 16),
+          Text("No active files found", style: TextStyle(color: Colors.grey, fontSize: 18)),
+          Text("Send a document to your bot first!", style: TextStyle(color: Colors.grey)),
+        ],
+      ),
+    );
+  }
+}
